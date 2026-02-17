@@ -4,7 +4,7 @@
 # DATE AND TIME VERSION of previous script
 set -o pipefail
 # This script collects NinjaOne logs from API and saves them a specified directory to send to a SIEM.
-declare -r Script_Version="0.3.16_20250930"
+declare -r Script_Version="0.3.21_20260217"
 # It requires the following environment variables to be set:
 # Client ID, Client Secret, API Endpoint, and Target Log Directory.
 declare -r AppName='ninjaone_collector'
@@ -27,6 +27,9 @@ declare DefaultEndpoint='https://us2.ninjarmm.com/v2/activities'
 declare -ir MaxPageSize=1000
 declare DefaultLogFormat='YYYYMMDD'
 declare -i StartAtActId
+declare ClassFilters=
+declare TypeFilters= 
+declare StatusFilters
 #declare -i ThisNow=$(date +%s) # get the datetime of this instance's runtime
 declare ApiEndpoint 
 declare DefaultLogPath="/var/log/${AppName}"
@@ -112,7 +115,11 @@ function get_all_actids () {
     local json="$*"
     local -a idlist
     if $UseNativeJsonParser; then # if jq is not available, use an ugly regex to parse json, note the look-ahead and look-behind to get only the activities array
-        readarray -t idlist <<< "$(grep -Pio '(?<={"id":)[0-9]+(?=,")' <<< "$json")"
+        if (( ${#json} <= 50 )); then
+            idlist[0]='null'
+        else
+            readarray -t idlist <<< "$(grep -Pio '(?<={"id":)[0-9]+(?=,")' <<< "$json")"
+        fi
     else
         readarray -t idlist <<< "$(jq -r '.activities[].id' <<< "$json")"
     fi
@@ -171,54 +178,40 @@ function check_token_expiration () {
     else { echo false; }
     fi
 }
-function parse_filter_logs () {
+function make_filters () {
     local filter_type="$1"
-    shift
-    local -a filters=( "$*" )
-    case ${filter_type,,} in
-        result|type|class ) filter_type="${filter_type,,}"  ;;
-        * ) echo "ERROR - [parse_filter_logs] Invalid filter type specified: [$filter_type]. Valid types are: result, type and class." >&2; return 1 ;;
-    esac
-    if (( ${#filters[@]} == 0 )); then # if no filters specified, return empty string
+    IFS=, read -ra values <<< "$2"
+    if (( ${#values[@]} == 0 )); then # if no filters specified, return empty string
         return 0
+    else
+        local output sep='&'
+        for val in "${values[@]}"; do
+            output+="${sep}${filter_type}=${val//\"/}"
+        done
+        echo "$output"
     fi
-    local sep=''
-    local output="$filter_type="
-    for filter in "${filters[@]}"; do
-        output+="${sep}${filter}"
-        sep='+'        
-    done
-    echo "$output"
 }
-function make_filter_from_file () {
+function make_status_filters_from_file () {
     local filter_file="$1"
-    local url_filters=''
+    local output
     if [[ -z "$filter_file" ]] || [[ ! -f "$filter_file" ]]; then
-        echo "WARNING - [make_filter_from_file] Invalid or missing filter file:[$filter_file]. No filters will be applied" >&2
-        echo "$url_filters"
+        echo "WARNING - [make_status_filters_from_file] Invalid or missing filter file:[$filter_file]. No filters will be applied" >&2
         return 0
     fi
     while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -z "$line" ]] && continue # skip empty lines
-        [[ "$line" =~ ^#.*$ ]] && continue # skip comments
-        IFS=' ' read -ra parts <<< "$line"
-        if (( ${#parts[@]} < 2 )); then
-            echo "WARNING - [make_filter_from_file] Invalid filter line:[$line] in filter file. Each line must contain a filter type and at least one filter value." >&2
-            continue
-        fi
-        local filter_type="${parts[0]}"
-        unset "parts[0]"
-        local filter_values=( "${parts[@]}" )
-        local filter_param=$(parse_filter_logs "$filter_type" "${filter_values[@]}")
-        if [[ -n "$filter_param" ]]; then
-            if [[ -z "$url_filters" ]]; then
-                url_filters+="&${filter_param}"
-            else
-                url_filters+="+${filter_param#*=}"
-            fi
+        if [[ -z "$line" ]] || [[ "$line" =~ ^#.*$ ]]; then
+            continue # skip empty lines
+        else
+            output+="&status=${line//\"/}"
         fi
     done < "$filter_file"
-    echo "$url_filters"
+    echo "$output"
+}
+function build_filter_string () {
+    local class_filts type_filts sep='&'
+    if [[ -n "$ClassFilters" ]]; then { class_filts=$(make_filters class "$ClassFilters"); } fi
+    if [[ -n "$TypeFilters" ]]; then { type_filts=$(make_filters type "$TypeFilters"); } fi
+    echo "${class_filts}${type_filts}"
 }
 # convert a json data stream to serialized log data in reverse order, since ninjaone logs come out backwards (newest-to-oldest)
 function serialize_logs () {
@@ -340,7 +333,8 @@ function convert_format () {
 }
 function get_configs_from_file () {
     local -a config_params=( 'API_ENDPOINT' 'TARGET_LOG_PATH' 'LOG_FORMAT' 'PAGE_SIZE' 'FIRST_RUN' 'START_DELAY' 'MAX_LOG_FILE_PERCENTAGE' 'MAX_RETRIES' 'RETRY_DELAY' 
-        'START_AT_ACTID' 'USE_NATIVE_JSON_PARSER' 'CREDENTIAL_PATH' 'FILTER_FILE' 'CLIENT_ID' 'SIGKEY' 'START_NOW' 'START_DATE_TIME' 'GET_ALL_AVAIL' ) 
+        'START_AT_ACTID' 'USE_NATIVE_JSON_PARSER' 'CREDENTIAL_PATH' 'FILTER_FILE' 'CLIENT_ID' 'SIGKEY' 'START_NOW' 'START_DATE_TIME' 'GET_ALL_AVAIL' 'INSTALL_DATE' 
+        'CLASS_FILTERS' 'TYPE_FILTERS' ) 
     for param in "${config_params[@]}"; do
         local value=$(read_config_file "$param")
         case ${param,,} in
@@ -362,25 +356,17 @@ function get_configs_from_file () {
             filter_file )           FilterFile="${value}" ;; # default filter file is null/empty, meaning no filters
             start_now )             StartNow="${value:-true}" ;;
             start_date_time )       StartDateTime="${value}" ;;
-            install_date )          InstallDate="$value"
+            install_date )          InstallDate="$value" ;;
+            class_filters )         ClassFilters="$value" ;; 
+            type_filters )          TypeFilters="$value" ;;
+            status_filters )        StatusFilters="$value" ;;
         esac 
     done 
-}
-function make_filters_from_file () {
-    local filter_file="$1"
-    if [[ -z "$filter_file" ]] || [[ ! -f "$filter_file" ]]; then
-        echo "WARNING - [make_url_from_config] Invalid or missing filter file:[$filter_file]. No filters will be applied" >&2
-    fi
-    if [[ -z "$ApiEndpoint" ]] && [[ -f "$ConfigPath" ]]; then # chck if endpoint was not set but the config file was installed, then load the configs 
-        get_configs_from_file
-    fi
-    local url_filters="&$(make_filter_from_file "$FilterFile")"
-    echo "${url_filters}"
 }
 function main () {
     local url json_logs
     local -a actids
-    local -i StartId FinalId FinalId
+    local -i StartId FinalId
     get_configs_from_file
     if [[ -f "$CredentialPath" && -n "$SigKey" ]]; then
         #local temp_credfile=$(mktemp /var/lib/${AppName}/.cred.XXXXXX)
@@ -409,28 +395,34 @@ function main () {
         echo "ERROR - [main] Disk usage for target log directory:[$TargetLogPath] has exceeded the maximum allowed percentage of $MaxLogFilePercentage% before first run. Exiting." >&2
         exit 1
     fi
-    # local filters=$(make_filters_from_file "$ApiEndpoint" "$FilterFile")
+    local filters=$(build_filter_string)
+    # STATUS CODES ARE NUMEROUS MESSY, IF THE USER WANTS TO FILTER BY THESE, LET THEM GIVE US A FILE
+    filters+=$(make_status_filters_from_file "$FilterFile")
     # Setup initial vars so we know where we are in the logs
     if $FirstRun; then
         if $StartNow; then # on first run, start at install datetime and get the latest log id
-            url="${ApiEndpoint}?after=${InstallDate}&pageSize=10" # this should bring back nothing but the latest log at most and the lastActivityId
+            url="${ApiEndpoint}?${filters}&after=${InstallDate}&pageSize=10" # this should bring back nothing but the latest log at most and the lastActivityId
             json_logs=$(collect_logs "$url" "$AuthToken")  # when using "NEWERTHAN" or "AFTER", you always get the absolute most recent logs, with now date should return no logs
             FinalId=$(get_lastactivity_id "$json_logs")
             StartId=$FinalId
         elif [[ "$StartDateTime" =~ $_NUM_REGEX ]] && ! $StartNow; then # on first run, convert start datetime to activity ID at that time
-            url="${ApiEndpoint}?before=${StartDateTime}&pageSize=10" # dont know where to start so this should bring oldest log before the startdatetime 
+            url="${ApiEndpoint}?${filters}&before=${StartDateTime}&pageSize=10" # dont know where to start so this should bring oldest log before the startdatetime 
             json_logs=$(collect_logs "$url" "$AuthToken")
             FinalId=$(get_lastactivity_id "$json_logs")
             IFS=' ' read -ra actids <<< "$(get_all_actids "$json_logs")"
-            StartId="${actids[-1]}" # set the next log pull target to PageSize or value set at installation to start from, the beginning of all logs
+            if [[ "${actids[0]}" != 'null' ]]; then
+                StartId="${actids[-1]}" # set the next log pull target to PageSize or value set at installation to start from, the beginning of all logs
+            else
+                StartId=$FinalId # we didnt get any logs, possibly filtered on the first run. nothing left to do but wait for the logs we want
+            fi
         elif $GetAllAvailableLogs; then
             echo "WARNING - THIS WILL COLLECT ALL LOGS AVAILABLE FROM NINJAONE"
-            url="${ApiEndpoint}?after=$(date +%s)&pageSize=10" # we are starting at 1 anyway so no need to start getting logs yet
+            url="${ApiEndpoint}?${filters}&after=$(date +%s)&pageSize=10" # we are starting at 1 anyway so no need to start getting logs yet
             json_logs=$(collect_logs "$url" "$AuthToken")  # when using "NEWERTHAN" or "AFTER", you always get the absolute most recent logs, with now date should return no logs
             FinalId=$(get_lastactivity_id "$json_logs")
             StartId=1
         elif [[ "$StartAtActId" =~ $_NUM_REGEX ]]; then
-            url="${ApiEndpoint}?after=$(date +%s)&pageSize=10" # we know where to start, no need to pull anything back yet; should bring back nothing but the latest log at most and the lastActivityId
+            url="${ApiEndpoint}?${filters}&after=$(date +%s)&pageSize=10" # we know where to start, no need to pull anything back yet; should bring back nothing but the latest log at most and the lastActivityId
             json_logs=$(collect_logs "$url" "$AuthToken")  # when using "NEWERTHAN" or "AFTER", you always get the absolute most recent logs, with now date should return no logs
             FinalId=$(get_lastactivity_id "$json_logs")
             StartId=$StartAtActId
@@ -446,10 +438,10 @@ function main () {
     local -i prev_last=$(( $StartId + $PageSize ))
     while true; do
         unset actids json_logs url
-        url="${ApiEndpoint}?olderThan=${StartId}&pageSize=$PageSize"
+        url="${ApiEndpoint}?${filters}&olderThan=${StartId}&pageSize=$PageSize"
         json_logs=$(collect_logs "$url" "$AuthToken")
         IFS=' ' read -ra actids <<< "$(get_all_actids "$json_logs")"
-        if (( $StartId <= $FinalId )) && (( ${#actids[@]} > 0 )); then
+        if [[ "${actids[0]}" != 'null' ]] && (( $StartId <= $FinalId )); then
             # deal with missing and overlapped log pulls
             local -i this_first=${actids[-1]} # first and lowest logid of this pull i.e. 19 or 29 for two sample pulls below, prev pulls are still last=19:first=6
             local -i this_last=${actids[0]} # last and highest logid of this pull i.e. 29 or 40 for two sample pulls below
@@ -459,13 +451,11 @@ function main () {
                 for (( i=print_start; i<${#logarray[@]}; i++  )); do
                     echo "${logarray[$i]}" | tee -a "${TargetLogPath}/ninjaone_logs_$(date +"$TargetLogFormat").log"
                 done
-                #prev_first=$this_first
                 prev_last=$this_last
                 StartId=$(( $StartId + $PageSize ))
             else # if no overlap, just print out all the logs, no need for an expensive logarray
                 echo "$json_logs" | serialize_logs | tee -a "${TargetLogPath}/ninjaone_logs_$(date +"$TargetLogFormat").log" && {
                     write_lastrun_to_state "$this_last" && update_config_file 'LASTRUN_ACTID' "${actids[0]}"
-                    #prev_first=$this_first
                     prev_last=$this_last
                     StartId=$(( $StartId + $PageSize ))
                 }
@@ -532,9 +522,7 @@ else
             -- ) shift; break ;;  # end of options     
         esac
     done
+
 fi
-collector_usage
+#collector_usage
 main
-
-
-
