@@ -55,9 +55,7 @@ declare -i RotateTimer=30 # log rotation timer in days
 declare -i MaxAge=60 # max age in days to keep old log files
 declare -i RunInterval=15 # interval in minutes to run the collector
 declare -i RunOnBootTime=5 # time in minutes to wait after boot before first run
-declare TimerFile="/etc/systemd/system/timers.target.wants/$AppName.timer"
-#tmp="/etc/systemd/system/timers.target.wants/$AppName.timer"
-#tmp="/etc/systemd/system/$AppName.timer"
+declare TimerFile="/usr/lib/systemd/system/$AppName.timer"
 declare ServiceFile="/lib/systemd/system/$AppName.service"
 declare RotationFile="/etc/logrotate.d/$AppName"
 declare -i MenuW=$(( $(tput cols) * 3/4 ))
@@ -589,9 +587,16 @@ function install_collector () {
             echo -e "${GRE}OKAY${NC} - Systemd service and timer files were created successfully."
             echo -e "${GRE}OKAY${NC} - Reloading daemon and attempting to start service. Please wait..."; sleep 2s
             systemctl daemon-reload 
+            systemctl enable --now $AppName.timer
             systemctl enable $AppName.service && systemctl start $AppName.service
             sleep 2s
             systemctl status $AppName.service --no-pager
+            if [[ -n "$(systemctl list-timers --all | grep -io $AppName.timer)" ]]; then
+                echo -e "${GRE}OKAY${NC} - Systemd service timer was installed and started successfully."
+            else
+                echo -e "${RED}ERROR${NC} - Failed to install systemd service timer at [${YEL}$TimerFile${NC}]. Check if you have rights to create system services on this machine."
+                uninstall_collector 'yes' 'rollback'
+            fi
         else
             echo -e "${RED}ERROR${NC} - installation failed; service file or timer service was not created."
             echo "Rolling back installation..."
